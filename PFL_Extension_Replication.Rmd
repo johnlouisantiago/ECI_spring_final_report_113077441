@@ -1,0 +1,526 @@
+---
+title: "Replication Code: State Economic Freedom and Firm Size as Moderators of Paid
+  Family Leave's Effect on Firm Risk-Taking"
+author: "John Loui Santiago (MBA, Business Analytics, National Tsing Hua University)"
+date: "June 21, 2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 8, fig.height = 5, dpi = 150
+)
+options(scipen = 999)
+```
+
+# Setup: packages, paths, options
+
+```{r packages}
+library("dplyr")
+library("tidyr")
+library("readr")
+library("readxl")
+library("fixest")
+library("did")
+library("ggplot2")
+library("knitr")
+```
+
+```{r paths}
+firm_path <- "final_panel_manufacturing.csv"
+efna_xlsx <- "economic-freedom-of-north-america-2025-full-dataset.xlsx"
+
+## Controls used throughout (identical to Pearl's thesis analysis)
+controls <- "ln_size_lag + ceo_age + ceo_gender + hhi + growth_volatility + unemp_rate + population + ln_GDP"
+
+treated_years <- c(CA = 2004, NJ = 2009, RI = 2014, NY = 2018)
+```
+
+# Upstream preprocessing (inherited from Pearl's 2025)
+
+> The chunks in this section are reproduced faithfully from Lin's
+> `replicationpackage/Data_preprocessing.Rmd`. They are set to `eval=FALSE` because they
+> need the raw replication-package inputs (`COMPUSTAT/`, `execucomp/`, `SAGDP/`, `SAINC/`,
+> `Unemp/`, `SME_size_standards.xlsx`). Running them end-to-end writes
+> `final_panel_manufacturing.csv`, the panel loaded in Section 3.
+
+## State controls — unemployment, GDP, population
+
+```{r prep-state-controls, eval=FALSE}
+# BLS local-area unemployment -> state-year unemployment rate
+unemp_rate <- unemp |>
+  mutate(unemp_rate = as.numeric(value)) |>
+  left_join(state_mapping, by = "state_code") |>
+  select(state, year, unemp_rate) |>
+  mutate(year = as.numeric(year))
+
+# BEA SAGDP -> state GDP and ln(GDP); BEA SAINC -> population
+GDP <- gdp_raw |>
+  left_join(state_mapping, by = "state_code") |>
+  mutate(ln_GDP = log(GDP))
+# (Population built analogously from SAINC.)
+```
+
+## PFL effective years (treatment timing)
+
+```{r prep-pfl, eval=FALSE}
+# Year each state's PFL *benefits become payable* (not the enactment year).
+has_PFL_list <- has_PFL_list |>
+  mutate(Effective_Year = case_when(
+    state == "CA" ~ 2004,
+    state == "NJ" ~ 2009,
+    state == "RI" ~ 2014,
+    state == "NY" ~ 2018,
+    TRUE ~ 0          # never-treated within the window
+  ))
+```
+
+## CEO characteristics (Execucomp)
+
+```{r prep-ceo, eval=FALSE}
+# Annual CEO per firm; attach age and gender, keep complete cases.
+ceo_panel <- exec_CEO |>
+  left_join(age_lookup, by = "EXECID") |>
+  left_join(gender_lookup, by = "EXECID") |>
+  rename(ceo_age = age, ceo_gender = gender) |>
+  select(GVKEY, YEAR, EXECID, ceo_age, ceo_gender) |>
+  filter(!is.na(ceo_age) & !is.na(ceo_gender))
+```
+
+## Firm financials and risk-taking components (Compustat)
+
+```{r prep-compustat, eval=FALSE}
+# Keep firm-years with NON-MISSING, NON-NEGATIVE R&D, capex, and leverage.
+# This is how R&D missingness is handled: Compustat leaves R&D blank (not zero) for
+# non-reporters, so xrd >= 0 drops blanks and the analysis sample has 0% missing R&D.
+compustat_raw <- compustat_1997_2023 |>
+  select(gvkey, datadate, fyear, naics, state, xrd, capx, dltt, emp, at, sale, oibdp) |>
+  filter(!is.na(fyear), !is.na(naics), !is.na(state),
+         state %in% unique(unemp_rate$state),
+         xrd >= 0, capx >= 0, dltt >= 0, !is.na(emp))
+
+risk_taking_raw <- compustat_raw |>
+  mutate(
+    naics2 = substr(as.character(naics), 1, 2),
+    naics4 = substr(as.character(naics), 1, 4),
+    RoA = oibdp,
+    emp = emp * 1000,
+    ln_size = log(at),
+    ln_sale = log(sale)
+  )
+```
+
+## Industry controls — HHI, munificence, growth volatility
+
+```{r prep-industry, eval=FALSE}
+# Herfindahl (sales-based) by industry-year.
+industry_hhi <- risk_taking_raw |>
+  group_by(naics2, fyear) |>
+  mutate(total_sales_hhi = sum(sale, na.rm = TRUE),
+         market_share = sale / total_sales_hhi,
+         market_share_sq = market_share^2) |>
+  summarise(hhi = sum(market_share_sq, na.rm = TRUE) * 10000, .groups = "drop")
+
+# Munificence (5-yr sales CAGR) and instability (rolling 5-yr SD of sales growth).
+industry_sales <- industry_sales |>
+  mutate(
+    cagr_munificence = ifelse(!is.na(sales_t5) & sales_t5 > 0,
+                               (sales_t1 / sales_t5)^(1/4) - 1, NA),
+    growth_volatility = zoo::rollapply(sales_growth, width = 5, FUN = sd,
+                                       na.rm = TRUE, fill = NA, align = "right")
+  )
+```
+
+## Lags
+
+```{r prep-lags, eval=FALSE}
+panel <- panel |>
+  group_by(gvkey) |>
+  arrange(fyear) |>
+  mutate(at_lag = lag(at, 1), sale_lag = lag(sale, 1), RoA_lag = lag(RoA, 1),
+         ln_size_lag = lag(ln_size, 1), ln_sale_lag = lag(ln_sale, 1)) |>
+  ungroup()
+```
+
+## Winsorization (1% / 99%)
+
+```{r prep-winsor, eval=FALSE}
+winsorize_manual <- function(x, probs = c(0.01, 0.99), na.rm = TRUE) {
+  q <- quantile(x, probs = probs, na.rm = na.rm)
+  x[x < q[1]] <- q[1]; x[x > q[2]] <- q[2]; x
+}
+vars_to_winsor <- c("xrd", "dltt", "capx", "at", "sale", "RoA",
+                    "hhi", "cagr_munificence", "growth_volatility")
+panel <- panel |> mutate(across(all_of(vars_to_winsor), winsorize_manual))
+```
+
+## Risk-taking factor score (outcome)
+
+```{r prep-factor, eval=FALSE}
+# One-factor analysis of standardized R&D, leverage, and capex -> factor_score (SD units).
+library(psych)
+data_matrix <- scale(panel[, c("xrd", "dltt", "capx")], center = TRUE, scale = TRUE)
+fa_result <- fa(data_matrix, nfactors = 1, scores = "regression")
+panel$factor_score <- fa_result$scores[, 1]
+```
+
+## SME indicator (SBA size standards) and manufacturing filter
+
+```{r prep-sme, eval=FALSE}
+# Industry-specific SBA employee thresholds; is_sme = 1 if employment below threshold.
+SME_size_standards <- openxlsx::read.xlsx("SME_size_standards.xlsx") |>
+  mutate(NAICS.Codes = as.character(as.integer(NAICS.Codes)))
+
+final_panel_manufacturing <- panel |>
+  filter(industry_label == "Manufacturing") |>
+  left_join(SME_size_standards, by = c("naics" = "NAICS.Codes")) |>
+  mutate(is_sme = if_else(emp < Size.standards.in.number.of.employees, 1L, 0L))
+
+readr::write_csv(final_panel_manufacturing, "final_panel_manufacturing.csv")
+```
+
+# Extension preprocessing (executable)
+
+## Load the firm panel and EFNA workbook
+
+```{r load-firm}
+firm <- read_csv(firm_path, show_col_types = FALSE)
+cat("Loaded firm panel:", nrow(firm), "firm-years,", n_distinct(firm$gvkey), "firms\n")
+
+## Data-quality check the professor asked about: R&D availability in the final panel.
+cat("R&D (xrd) missing:", sum(is.na(firm$xrd)),
+    "| exactly zero:", sum(firm$xrd == 0, na.rm = TRUE), "\n")
+```
+
+## Baseline (2000–2003) economic freedom by state
+
+```{r efna-baseline}
+abbr <- c(Alabama="AL", Alaska="AK", Arizona="AZ", Arkansas="AR", California="CA",
+          Colorado="CO", Connecticut="CT", Delaware="DE", Florida="FL",
+          Georgia="GA", Hawaii="HI", Idaho="ID", Illinois="IL", Indiana="IN", 
+          Iowa="IA", Kansas="KS", Kentucky="KY", Louisiana="LA", Maine="ME", 
+          Maryland="MD", Massachusetts="MA", Michigan="MI", Minnesota="MN", 
+          Mississippi="MS", Missouri="MO", Montana="MT", Nebraska="NE", 
+          Nevada="NV", `New Hampshire`="NH", `New Jersey`="NJ", `New Mexico`="NM",
+          `New York`="NY", `North Carolina`="NC", `North Dakota`="ND", Ohio="OH", 
+          Oklahoma="OK", Oregon="OR", Pennsylvania="PA", `Rhode Island`="RI",
+          `South Carolina`="SC", `South Dakota`="SD", Tennessee="TN", Texas="TX", 
+          Utah="UT", Vermont="VT", Virginia="VA", Washington="WA", 
+          `West Virginia`="WV", Wisconsin="WI", Wyoming="WY")
+
+raw  <- read_excel(efna_xlsx, sheet = "Overall-scores(subn)", col_names = FALSE)
+wide <- as.data.frame(lapply(raw[-1, 2:44], as.numeric))   # 43 columns = years 1981:2023
+names(wide) <- as.character(1981:2023)
+wide$state <- raw[[1]][-1]
+
+base <- wide |>
+  pivot_longer(-state, names_to = "year", values_to = "efi_overall") |>
+  mutate(year = as.integer(year), st = abbr[state]) |>
+  filter(!is.na(st), year >= 2000, year <= 2003) |>
+  group_by(st) |>
+  summarise(efi_base = mean(efi_overall, na.rm = TRUE), .groups = "drop")
+
+cat("National mean / median baseline EFNA:",
+    round(mean(base$efi_base), 2), "/", round(median(base$efi_base), 2), "\n")
+```
+
+## Build the analysis sample
+
+The reusable builder below applies the four design choices and is reused for the
+robustness checks in Section 8: the estimation `window`, whether to **exclude Rhode
+Island**, and whether to keep **stable-headquarters firms only** (dropping relocators
+= "movers").
+
+```{r build-dm}
+build_dm <- function(window = 2019, exclude_RI = TRUE, stable_only = TRUE) {
+
+  # stable-HQ firms: a single headquarters state across the window
+  stable_firms <- firm |>
+    filter(fyear <= window) |>
+    group_by(gvkey) |>
+    summarise(n_states = n_distinct(state), .groups = "drop") |>
+    filter(n_states == 1) |> pull(gvkey)
+
+  # baseline (pre-treatment) SME status: firm's earliest non-missing is_sme
+  sme_base_tbl <- firm |>
+    filter(!is.na(is_sme)) |> arrange(gvkey, fyear) |>
+    group_by(gvkey) |> summarise(sme_base = first(is_sme), .groups = "drop")
+
+  d <- firm |> filter(fyear <= window)
+  if (stable_only) d <- d |> filter(gvkey %in% stable_firms)
+  if (exclude_RI) d <- d |> filter(state != "RI")
+
+  d |>
+    left_join(base, by = c("state" = "st")) |>
+    left_join(sme_base_tbl, by = "gvkey") |>
+    mutate(
+      post = as.integer(Effective_Year > 0 & fyear >= Effective_Year),
+      efi_base_c = efi_base - mean(efi_base, na.rm = TRUE),     # mean-centered
+      g = ifelse(Effective_Year > 0 & Effective_Year <= window, Effective_Year, 0),
+      gvkey_num  = as.integer(factor(gvkey))
+    )
+}
+
+## Main analysis sample (pre-COVID, stable-HQ, Rhode Island excluded).
+dm <- build_dm(window = 2019, exclude_RI = TRUE, stable_only = TRUE)
+
+cat("Analysis sample:", nrow(dm), "firm-years |", n_distinct(dm$gvkey), "firms |",
+    "treated states:", paste(sort(unique(dm$state[dm$post == 1])), collapse = ", "), "\n")
+cat("Baseline SMEs:", sum(dm$sme_base == 1 & !duplicated(dm$gvkey), na.rm = TRUE),
+    "| larger firms:", sum(dm$sme_base == 0 & !duplicated(dm$gvkey), na.rm = TRUE), "\n")
+```
+
+
+# Treated cohorts (timing, baseline freedom, size)
+
+```{r table2}
+# rank of each treated state's baseline freedom among all 50 states (1 = freest)
+base_rank <- base |> mutate(rank = rank(-efi_base, ties.method = "min"))
+
+cohort_src <- build_dm(window = 2019, exclude_RI = FALSE, stable_only = TRUE)  # keep RI here
+
+table2 <- cohort_src |>
+  filter(state %in% names(treated_years)) |>
+  group_by(state) |>
+  summarise(Firms = n_distinct(gvkey), `Firm-years` = n(), .groups = "drop") |>
+  left_join(base_rank, by = c("state" = "st")) |>
+  mutate(`Benefits payable` = treated_years[state],
+         `EFNA baseline (2000-03)` = round(efi_base, 2),
+         `Rank (of 50, 1=freest)` = rank,
+         State = ifelse(state == "RI", "Rhode Island (excluded)", state)) |>
+  arrange(`Benefits payable`) |>
+  select(State, `Benefits payable`, `EFNA baseline (2000-03)`,
+         `Rank (of 50, 1=freest)`, Firms, `Firm-years`)
+
+kable(table2, caption = "Treated cohorts: timing, baseline economic freedom, and size.")
+```
+
+# Specification menu (TWFE / DDD)
+
+Each specification adds one piece. `post` = PFL indicator; `efi_base_c` = mean-centered
+baseline economic freedom; `sme_base` = baseline SME indicator. Time-invariant moderator
+main effects are absorbed by the firm fixed effect, so only their interactions with `post`
+are identified. Standard errors clustered by state.
+
+```{r specs}
+fe <- function(rhs)
+  feols(as.formula(paste("factor_score ~", rhs, "| gvkey + fyear")), dm, cluster = ~state)
+
+m_main <- fe(paste("post +", controls))
+m_A1 <- fe(paste("post + post:efi_base_c +", controls))
+m_A2 <- fe(paste("post + post:sme_base +", controls))
+m_B <- fe(paste("post + post:efi_base_c + post:sme_base +", controls))
+m_C <- fe(paste("post + post:efi_base_c + post:sme_base + post:efi_base_c:sme_base +",
+                     controls))
+
+# drop-California robustness for the EFNA slope
+m_noCA <- feols(as.formula(paste("factor_score ~ post + post:efi_base_c +",
+                                 controls, "| gvkey + fyear")),
+                filter(dm, state != "CA"), cluster = ~state)
+```
+
+```{r specs-fixest-table}
+# fixest's native side-by-side table
+etable(m_A1, m_A2, m_B, m_C,
+       dict = c(post = "PFL (post)",
+                "post:efi_base_c" = "PFL x EconFreedom",
+                "post:sme_base" = "PFL x SME",
+                "post:efi_base_c:sme_base" = "PFL x EconFreedom x SME"),
+       headers = c("A1", "A2", "B", "C"))
+```
+
+```{r specs-clean-table}
+cf <- function(m, term) {
+  ct <- summary(m)$coeftable
+  if (!term %in% rownames(ct)) return(c(NA, NA, NA))
+  unname(ct[term, c(1, 2, 4)])
+}
+
+row <- function(label, v, note) data.frame(
+  Specification = label, Estimate = round(v[1], 3),
+  SE = round(v[2], 3), p = round(v[3], 3), Note = note)
+
+table4 <- rbind(
+  row("PFL (main effect)", cf(m_main, "post"), "replicates Lin"),
+  row("A1. PFL x EconFreedom", cf(m_A1, "post:efi_base_c"),
+      "positive; weakens with SME"),
+  row("A2. PFL x SME", cf(m_A2,   "post:sme_base"),
+      "effect smaller for SMEs"),
+  row("B. PFL x EconFreedom (with SME)", cf(m_B, "post:efi_base_c"),
+      "shrinks once SME held constant"),
+  row("B. PFL x SME (with EconFreedom)", cf(m_B, "post:sme_base"),
+      "robust to adding EconFreedom"),
+  row("C. PFL x EconFreedom x SME", cf(m_C, "post:efi_base_c:sme_base"),
+      "negative; leans Camp B"))
+
+kable(table4, 
+      caption = "Specification menu (TWFE/DDD coefficients; Rhode Island excluded).")
+
+cat("Drop-California robustness, PFL x EconFreedom =",
+    round(coef(m_noCA)["post:efi_base_c"], 3), "\n")
+```
+
+# Implied PFL effect by treated state (from A1)
+
+```{r implied}
+co  <- coef(m_A1)
+
+mef <- mean(dm$efi_base, na.rm = TRUE)
+
+implied <- base |>
+  filter(st %in% names(treated_years)) |>
+  mutate(`Implied PFL effect` = round(
+    co["post"] + co["post:efi_base_c"] * (efi_base - mef), 3)) |>
+  arrange(efi_base) |>
+  transmute(State = st, `EFNA baseline` = round(efi_base, 2), `Implied PFL effect`)
+
+kable(implied, caption = "Implied PFL effect by treated state, ordered by baseline economic freedom.")
+```
+
+# Callaway–Sant'Anna estimates (combined and stratified)
+
+The Callaway–Sant'Anna (2021) estimator has no native moderator term, so the moderation is
+recovered by **stratifying** the sample and comparing staggered-robust ATTs. Each stratum
+keeps the never-treated firms (`g == 0`) as controls. `allow_unbalanced_panel = TRUE` is
+required: the small SME cohorts collapse under the default balanced-panel conversion.
+A **combined (pooled)** ATT over all firms is reported alongside.
+
+```{r csa}
+cs_att <- function(sub) {
+  a <- att_gt(yname = "factor_score", tname = "fyear", idname = "gvkey_num", gname = "g",
+              data = sub, control_group = "notyettreated", clustervars = "state",
+              bstrap = TRUE, allow_unbalanced_panel = TRUE)
+  s <- aggte(a, type = "simple")
+  c(ATT = round(s$overall.att, 3), SE = round(s$overall.se, 3))
+}
+
+dm_s <- dm |> mutate(hi = as.integer(efi_base >= median(base$efi_base, na.rm = TRUE)))
+
+combined <- cs_att(dm_s)
+hi_freedom <- cs_att(filter(dm_s, hi == 1 | g == 0))
+lo_freedom <- cs_att(filter(dm_s, hi == 0 | g == 0))
+sme_grp <- cs_att(filter(dm_s, sme_base == 1 | g == 0))
+non_sme <- cs_att(filter(dm_s, sme_base == 0 | g == 0))
+
+table5 <- data.frame(
+  Stratum = c("Combined (pooled, all firms)",
+              "High-freedom cohort (New Jersey)",
+              "Low-freedom cohorts (California, New York)",
+              "SME firms", "Non-SME (large) firms"),
+  ATT = c(combined["ATT"], hi_freedom["ATT"], lo_freedom["ATT"],
+          sme_grp["ATT"], non_sme["ATT"]),
+  `Std. error` = c(combined["SE"], hi_freedom["SE"], lo_freedom["SE"],
+                   sme_grp["SE"], non_sme["SE"]), check.names = FALSE)
+
+kable(table5, row.names = FALSE,
+      caption = "Callaway-Sant'Anna ATT: combined and stratified (bootstrap SEs, clustered by state).")
+```
+
+# Robustness (post-COVID, movers, Rhode Island)
+
+Re-estimates the main effect and the firm-size interaction under each design perturbation
+the reviewer flagged, by re-running `build_dm()` with different arguments.
+
+```{r robustness}
+rob_fit <- function(d) {
+  mm <- feols(as.formula(paste("factor_score ~ post +", controls, "| gvkey + fyear")),
+              d, cluster = ~state)
+  ms <- feols(as.formula(paste("factor_score ~ post + post:sme_base +", controls,
+              "| gvkey + fyear")), d, cluster = ~state)
+  stars <- function(p) ifelse(p < .01, "***",
+                              ifelse(p < .05, "**", ifelse(p < .1, "*", "")))
+  c(main = sprintf("%+.3f%s", coef(mm)["post"], stars(cf(mm, "post")[3])),
+    sme = sprintf("%+.3f%s", coef(ms)["post:sme_base"],
+                   stars(cf(ms, "post:sme_base")[3])))
+}
+
+settings <- list(
+  "Baseline (<=2019; no RI, no movers)" = build_dm(2019, TRUE,  TRUE),
+  "+ Post-COVID years (through 2022)" = build_dm(2022, TRUE,  TRUE),
+  "+ Relocating firms (movers)" = build_dm(2019, TRUE,  FALSE),
+  "+ Rhode Island (excluded cohort)" = build_dm(2019, FALSE, TRUE))
+
+table6 <- do.call(rbind, lapply(names(settings), function(nm) {
+  r <- rob_fit(settings[[nm]])
+  data.frame(`Sample / check` = nm, `PFL (main)` = r["main"],
+             `PFL x SME` = r["sme"], check.names = FALSE, row.names = NULL)
+}))
+
+kable(table6, caption = "Robustness of the main effect and firm-size moderation. *** p<.01, ** p<.05.")
+```
+
+# Figures
+
+## Figure 1 — Rhode Island pre-trend violation
+
+```{r fig-ri, fig.height=4.6}
+ctrl_states <- setdiff(unique(firm$state), names(treated_years)) # never-treated
+
+ri_df <- bind_rows(firm |> 
+    filter(state == "RI", fyear >= 2002, fyear <= 2019) |>
+    group_by(fyear) |>
+    summarise(m = mean(factor_score, na.rm = TRUE), .groups = "drop") |>
+    mutate(series = "Rhode Island (4 firms, 51 firm-years)"), firm |>
+    filter(state %in% ctrl_states, fyear >= 2002, fyear <= 2019) |>
+    group_by(fyear) |>
+    summarise(m = mean(factor_score, na.rm = TRUE), .groups = "drop") |>
+    mutate(series = "Never-treated control mean"))
+
+ggplot(ri_df, aes(fyear, m, color = series, linetype = series)) +
+  annotate("rect", xmin = 2002, xmax = 2014, ymin = -Inf, ymax = Inf,
+           fill = "grey90", alpha = .5) +
+  geom_vline(xintercept = 2014, color = "firebrick", linetype = "dashed") +
+  geom_line(linewidth = 1) + geom_point(size = 1.6) +
+  annotate("text", x = 2014.2, y = max(ri_df$m), hjust = 0,
+           label = "RI benefits effective (2014)", color = "firebrick", size = 3.3) +
+  scale_color_manual(values = c("Rhode Island (4 firms, 51 firm-years)" = "#1F3864",
+                                "Never-treated control mean" = "grey55")) +
+  scale_linetype_manual(values = c("Rhode Island (4 firms, 51 firm-years)" = "solid",
+                                   "Never-treated control mean" = "dashed")) +
+  labs(title = "Rhode Island diverges from controls before treatment (pre-trend violation)",
+       x = "Fiscal year", y = "Mean firm risk-taking (factor score, SD units)",
+       color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+## Figure 2 — Firm-size stratification (staggered-robust ATT)
+
+```{r fig-size, fig.height=4.2}
+size_df <- data.frame(
+  group = factor(c("Non-SME (large) firms", "SME firms"),
+                 levels = c("Non-SME (large) firms", "SME firms")),
+  att = c(non_sme["ATT"], sme_grp["ATT"]),
+  se = c(non_sme["SE"],  sme_grp["SE"]))
+
+ggplot(size_df, aes(group, att, fill = group)) +
+  geom_col(width = .6) +
+  geom_errorbar(aes(ymin = att - se, ymax = att + se), width = .15) +
+  geom_hline(yintercept = 0, color = "grey40") +
+  geom_text(aes(label = sprintf("%+.3f", att)), 
+            nudge_x = 0.36, hjust = 0) + 
+  scale_fill_manual(values = c("Non-SME (large) firms" = "#1F3864",
+                               "SME firms" = "#9DB4D4")) +
+  labs(title = "PFL effect on risk-taking is concentrated in large firms",
+       x = NULL, y = "Callaway-Sant'Anna ATT (SD units)") +
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+```
+
+## Figure 3 — Implied PFL effect by state (ordered by economic freedom)
+
+```{r fig-implied, fig.height=4.2}
+imp_df <- implied |>
+  mutate(State = factor(State, levels = State[order(`EFNA baseline`)]))
+
+ggplot(imp_df, aes(State, `Implied PFL effect`, fill = `EFNA baseline`)) +
+  geom_col(width = .6) +
+  geom_text(aes(label = sprintf("%.3f", `Implied PFL effect`)), vjust = -0.6) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_gradient(low = "#9DB4D4", high = "#1F3864") +
+  labs(title = "Implied PFL effect rises with state economic freedom",
+       subtitle = "Only New Jersey is above the national median, so the slope rests on one cohort",
+       x = "Treated state (low to high baseline economic freedom)",
+       y = "Implied PFL effect (SD units)") +
+  theme_minimal(base_size = 12) + theme(legend.position = "right")
+```
+
